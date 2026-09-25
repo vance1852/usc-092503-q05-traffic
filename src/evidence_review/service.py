@@ -280,28 +280,52 @@ class EvidenceReviewService:
             raise Conflict("该证据记录已有待处理或生效排除") from exc
         return {"exclusion_id": exclusion_id, "status": "pending"}
 
+    def _record_review_attempt(
+        self, exclusion_id: int, actor_id: str, decision: str, note: str, outcome: str
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO exclusion_review_attempts(exclusion_id,actor_id,decision,note,outcome,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (exclusion_id, actor_id, decision, note or "", outcome, self._now()),
+        )
+
     def review_exclusion(
         self, actor_id: str, exclusion_id: int, approve: bool, note: str
     ) -> dict[str, Any]:
         self._require(actor_id, "exclusion.review")
-        row = self.connection.execute(
-            "SELECT * FROM exclusion_requests WHERE exclusion_id=?", (exclusion_id,)
-        ).fetchone()
-        if row is None:
-            raise NotFound("排除申请不存在")
-        if row["status"] != "pending":
-            raise InvalidState("排除申请已经处理")
-        if row["requested_by"] == actor_id:
-            raise Forbidden("申请人不能复核自己的排除申请")
         status = "approved" if approve else "rejected"
         with transaction(self.connection, immediate=True):
-            self.connection.execute(
-                "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
-                "WHERE exclusion_id=? AND status='pending'",
-                (status, actor_id, self._now(), note, exclusion_id),
-            )
-            self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note})
-        return {"exclusion_id": exclusion_id, "status": status}
+            row = self.connection.execute(
+                "SELECT * FROM exclusion_requests WHERE exclusion_id=?", (exclusion_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound("排除申请不存在")
+            if row["status"] == "pending":
+                if row["requested_by"] == actor_id:
+                    raise Forbidden("申请人不能复核自己的排除申请")
+                cursor = self.connection.execute(
+                    "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
+                    "WHERE exclusion_id=? AND status='pending'",
+                    (status, actor_id, self._now(), note, exclusion_id),
+                )
+                if cursor.rowcount != 1:
+                    raise Conflict("排除申请复核状态已变化")
+                self._record_review_attempt(exclusion_id, actor_id, status, note, "applied")
+                self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note})
+                outcome = "applied"
+            elif (
+                row["status"] == status
+                and row["reviewed_by"] == actor_id
+                and row["review_note"] == note
+            ):
+                self._record_review_attempt(exclusion_id, actor_id, status, note, "duplicate")
+                outcome = "duplicate"
+            else:
+                self._record_review_attempt(exclusion_id, actor_id, status, note, "conflict")
+                outcome = "conflict"
+        if outcome == "conflict":
+            raise Conflict("排除申请已形成生效复核决定")
+        return {"exclusion_id": exclusion_id, "status": status, "outcome": outcome}
 
     def revoke_exclusion(self, actor_id: str, exclusion_id: int, reason: str) -> dict[str, Any]:
         self._require(actor_id, "exclusion.revoke")
@@ -529,10 +553,24 @@ class EvidenceReviewService:
                 "SELECT * FROM decisions WHERE analysis_id=?", (analysis_row["analysis_id"],)
             ).fetchone()
         exclusions = self.connection.execute(
-            "SELECT e.exclusion_id,e.evidence_item_id,e.status,e.reason,e.requested_by,e.reviewed_by "
+            "SELECT e.exclusion_id,e.evidence_item_id,e.status,e.reason,e.requested_by,e.reviewed_by,"
+            "e.reviewed_at,e.review_note "
             "FROM exclusion_requests e JOIN evidence_items o ON o.evidence_item_id=e.evidence_item_id "
             "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
         ).fetchall()
+        attempt_rows = self.connection.execute(
+            "SELECT a.attempt_id,a.exclusion_id,a.actor_id,a.decision,a.note,a.outcome,a.created_at "
+            "FROM exclusion_review_attempts a "
+            "JOIN exclusion_requests e ON e.exclusion_id=a.exclusion_id "
+            "JOIN evidence_items o ON o.evidence_item_id=e.evidence_item_id "
+            "WHERE o.batch_id=? ORDER BY a.attempt_id", (batch_id,)
+        ).fetchall()
+        attempt_counts: dict[int, dict[str, int]] = {}
+        for attempt in attempt_rows:
+            counts = attempt_counts.setdefault(
+                attempt["exclusion_id"], {"applied": 0, "duplicate": 0, "conflict": 0}
+            )
+            counts[attempt["outcome"]] += 1
         events = self.connection.execute(
             "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
             "WHERE entity_type='batch' AND entity_id=? "
@@ -555,6 +593,14 @@ class EvidenceReviewService:
                 "result": json.loads(analysis_row["result_json"]),
             },
             "decision": None if decision_row is None else dict(decision_row),
-            "exclusions": [dict(row) for row in exclusions],
+            "exclusions": [
+                dict(row) | {
+                    "attempt_counts": attempt_counts.get(
+                        row["exclusion_id"], {"applied": 0, "duplicate": 0, "conflict": 0}
+                    )
+                }
+                for row in exclusions
+            ],
+            "review_attempts": [dict(row) for row in attempt_rows],
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -108,6 +108,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_open_exclusion_per_evidence_item
 ON exclusion_requests(evidence_item_id)
 WHERE status IN ('pending', 'approved');
 
+CREATE TABLE IF NOT EXISTS exclusion_review_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exclusion_id INTEGER NOT NULL REFERENCES exclusion_requests(exclusion_id),
+    actor_id TEXT NOT NULL REFERENCES users(user_id),
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    note TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('applied', 'duplicate', 'conflict')),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS exclusion_review_attempts_by_exclusion
+ON exclusion_review_attempts(exclusion_id, attempt_id);
+
 CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
@@ -161,8 +174,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "evidence_protocol_catalog", "users", "capture_devices", "builds", "batches",
-    "evidence_items", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "evidence_items", "idempotency_keys", "exclusion_requests", "exclusion_review_attempts",
+    "analysis_jobs", "analyses", "decisions", "audit_events",
 })
 
 
