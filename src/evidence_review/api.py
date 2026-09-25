@@ -106,7 +106,8 @@ class JsonApplication:
                 return Response(201, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "exclusions" and parts[2] == "review":
                 result = self.service.review_exclusion(
-                    self._actor(normalized_headers), int(parts[1]), bool(payload["approve"]), payload.get("note", "")
+                    self._actor(normalized_headers), int(parts[1]), bool(payload["approve"]),
+                    payload.get("note", ""), normalized_headers.get("idempotency-key", "").strip() or None,
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "exclusions" and parts[2] == "revoke":
@@ -135,7 +136,10 @@ class JsonApplication:
                 return Response(201, result)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+            if getattr(exc, "details", None):
+                error["details"] = exc.details
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -108,6 +109,35 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_open_exclusion_per_evidence_item
 ON exclusion_requests(evidence_item_id)
 WHERE status IN ('pending', 'approved');
 
+-- 一份排除申请至多存在一个有效复核决定：主键由数据库强制，
+-- 并发裁决中只有一个事务能插入成功，跨连接与进程重启均成立。
+CREATE TABLE IF NOT EXISTS review_decisions (
+    exclusion_id INTEGER PRIMARY KEY REFERENCES exclusion_requests(exclusion_id),
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    note TEXT NOT NULL,
+    decided_by TEXT NOT NULL REFERENCES users(user_id),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    idempotency_key TEXT,
+    decided_at TEXT NOT NULL
+);
+
+-- 每次复核请求的裁决台账：有效决定 / 网络重试重放 / 竞争失败各占一行，
+-- 竞争失败不写入 audit_events，因此这里是区分三类请求的唯一权威来源。
+CREATE TABLE IF NOT EXISTS review_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exclusion_id INTEGER NOT NULL REFERENCES exclusion_requests(exclusion_id),
+    outcome TEXT NOT NULL CHECK (outcome IN ('effective', 'replay', 'lost_conflict')),
+    requested_decision TEXT NOT NULL CHECK (requested_decision IN ('approved', 'rejected')),
+    actor_id TEXT NOT NULL REFERENCES users(user_id),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    idempotency_key TEXT,
+    effective_exclusion_id INTEGER REFERENCES review_decisions(exclusion_id),
+    attempted_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS review_attempts_exclusion_idx
+ON review_attempts(exclusion_id, attempt_id);
+
 CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
@@ -161,8 +191,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "evidence_protocol_catalog", "users", "capture_devices", "builds", "batches",
-    "evidence_items", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "evidence_items", "idempotency_keys", "exclusion_requests", "review_decisions",
+    "review_attempts", "analysis_jobs", "analyses", "decisions", "audit_events",
 })
 
 
@@ -190,11 +220,41 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _backfill_review_decisions(connection: sqlite3.Connection) -> None:
+    """把旧版本中已裁决但未登记的有效决定补入裁决表与台账。"""
+
+    rows = connection.execute(
+        "SELECT exclusion_id,status,review_note,reviewed_by,reviewed_at,requested_by,requested_at "
+        "FROM exclusion_requests WHERE status IN ('approved','rejected') "
+        "AND NOT EXISTS (SELECT 1 FROM review_decisions d WHERE d.exclusion_id=exclusion_requests.exclusion_id)"
+    ).fetchall()
+    for row in rows:
+        basis = f"{row['exclusion_id']}|{row['status']}|{row['reviewed_by'] or ''}|{row['reviewed_at'] or ''}"
+        digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()
+        connection.execute(
+            "INSERT INTO review_decisions(exclusion_id,decision,note,decided_by,request_sha256,"
+            "idempotency_key,decided_at) VALUES(?,?,?,?,?,?,?)",
+            (
+                row["exclusion_id"], row["status"], row["review_note"] or "",
+                row["reviewed_by"] or row["requested_by"], digest, None,
+                row["reviewed_at"] or row["requested_at"],
+            ),
+        )
+    connection.execute(
+        "INSERT INTO review_attempts(exclusion_id,outcome,requested_decision,actor_id,request_sha256,"
+        "idempotency_key,effective_exclusion_id,attempted_at) "
+        "SELECT exclusion_id,'effective',decision,decided_by,request_sha256,NULL,exclusion_id,decided_at "
+        "FROM review_decisions WHERE NOT EXISTS ("
+        "SELECT 1 FROM review_attempts a WHERE a.exclusion_id=review_decisions.exclusion_id)"
+    )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        _backfill_review_decisions(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

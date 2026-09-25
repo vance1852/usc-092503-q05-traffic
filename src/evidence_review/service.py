@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import EvidenceItem, EvidenceProtocol, ValidationError
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, NotFound, ReviewConflict, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
 
@@ -281,27 +281,147 @@ class EvidenceReviewService:
         return {"exclusion_id": exclusion_id, "status": "pending"}
 
     def review_exclusion(
-        self, actor_id: str, exclusion_id: int, approve: bool, note: str
+        self,
+        actor_id: str,
+        exclusion_id: int,
+        approve: bool,
+        note: str,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """对排除申请形成唯一有效复核决定。
+
+        状态读取、决定落库、状态翻转与审计在同一个 IMMEDIATE 事务内完成，
+        由数据库的 review_decisions 主键保证一份申请至多一个有效决定：
+        并发裁决中只有一个请求成为 effective；竞争失败者记为 lost_conflict
+        并得到 409，不产生决定审计；相同请求的重试得到已生效决定（replay）。
+        """
+
         self._require(actor_id, "exclusion.review")
-        row = self.connection.execute(
-            "SELECT * FROM exclusion_requests WHERE exclusion_id=?", (exclusion_id,)
-        ).fetchone()
-        if row is None:
-            raise NotFound("排除申请不存在")
-        if row["status"] != "pending":
-            raise InvalidState("排除申请已经处理")
-        if row["requested_by"] == actor_id:
-            raise Forbidden("申请人不能复核自己的排除申请")
+        key = idempotency_key.strip() if idempotency_key and idempotency_key.strip() else None
         status = "approved" if approve else "rejected"
+        request_digest = content_digest([
+            {"exclusion_id": exclusion_id, "decision": status, "note": note}
+        ])
+        now = self._now()
+
+        conflict: dict[str, Any] | None = None
+        response: dict[str, Any] | None = None
         with transaction(self.connection, immediate=True):
-            self.connection.execute(
-                "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
-                "WHERE exclusion_id=? AND status='pending'",
-                (status, actor_id, self._now(), note, exclusion_id),
+            request_row = self.connection.execute(
+                "SELECT requested_by FROM exclusion_requests WHERE exclusion_id=?", (exclusion_id,)
+            ).fetchone()
+            if request_row is None:
+                raise NotFound("排除申请不存在")
+            if request_row["requested_by"] == actor_id:
+                raise Forbidden("申请人不能复核自己的排除申请")
+
+            decision_row = self.connection.execute(
+                "SELECT * FROM review_decisions WHERE exclusion_id=?", (exclusion_id,)
+            ).fetchone()
+
+            if decision_row is None:
+                # 尚无有效决定：尝试原子占位。并发时只有一个 INSERT 成功。
+                try:
+                    self.connection.execute(
+                        "INSERT INTO review_decisions(exclusion_id,decision,note,decided_by,"
+                        "request_sha256,idempotency_key,decided_at) VALUES(?,?,?,?,?,?,?)",
+                        (exclusion_id, status, note, actor_id, request_digest, key, now),
+                    )
+                except sqlite3.IntegrityError:
+                    decision_row = self.connection.execute(
+                        "SELECT * FROM review_decisions WHERE exclusion_id=?", (exclusion_id,)
+                    ).fetchone()
+                    conflict = self._record_review_attempt(
+                        exclusion_id, "lost_conflict", status, actor_id, request_digest, key,
+                        decision_row["exclusion_id"], now,
+                    )
+                else:
+                    cursor = self.connection.execute(
+                        "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
+                        "WHERE exclusion_id=? AND status='pending'",
+                        (status, actor_id, now, note, exclusion_id),
+                    )
+                    if cursor.rowcount != 1:
+                        # 占位成功但申请已非待处理：数据库状态不自洽，整体回滚。
+                        raise InvalidState("排除申请状态已变化，无法形成复核决定")
+                    self._audit(
+                        "exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note}
+                    )
+                    self._record_review_attempt(
+                        exclusion_id, "effective", status, actor_id, request_digest, key,
+                        exclusion_id, now,
+                    )
+                    response = {
+                        "exclusion_id": exclusion_id,
+                        "status": status,
+                        "review_outcome": "effective",
+                        "decided_by": actor_id,
+                        "decided_at": now,
+                    }
+            else:
+                same_retry = (
+                    decision_row["request_sha256"] == request_digest
+                    and decision_row["decided_by"] == actor_id
+                )
+                same_key = key is not None and decision_row["idempotency_key"] == key
+                if not (same_retry or same_key):
+                    conflict = self._record_review_attempt(
+                        exclusion_id, "lost_conflict", status, actor_id, request_digest, key,
+                        decision_row["exclusion_id"], now,
+                    )
+                else:
+                    self._record_review_attempt(
+                        exclusion_id, "replay", decision_row["decision"], actor_id, request_digest, key,
+                        decision_row["exclusion_id"], now,
+                    )
+                    response = {
+                        "exclusion_id": exclusion_id,
+                        "status": decision_row["decision"],
+                        "review_outcome": "replay",
+                        "decided_by": decision_row["decided_by"],
+                        "decided_at": decision_row["decided_at"],
+                    }
+
+        # 台账已随事务提交后再抛出冲突，保证竞争失败可见且不留虚假审计。
+        if conflict is not None:
+            raise ReviewConflict(
+                f"排除申请 {exclusion_id} 已有有效复核决定: {conflict['existing_status']}",
+                details=conflict,
             )
-            self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note})
-        return {"exclusion_id": exclusion_id, "status": status}
+        assert response is not None
+        return response
+
+    def _record_review_attempt(
+        self,
+        exclusion_id: int,
+        outcome: str,
+        requested_decision: str,
+        actor_id: str,
+        request_digest: str,
+        idempotency_key: str | None,
+        effective_exclusion_id: int,
+        now: str,
+    ) -> dict[str, Any]:
+        self.connection.execute(
+            "INSERT INTO review_attempts(exclusion_id,outcome,requested_decision,actor_id,"
+            "request_sha256,idempotency_key,effective_exclusion_id,attempted_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                exclusion_id, outcome, requested_decision, actor_id, request_digest,
+                idempotency_key, effective_exclusion_id, now,
+            ),
+        )
+        effective = self.connection.execute(
+            "SELECT decision,decided_by,decided_at FROM review_decisions WHERE exclusion_id=?",
+            (effective_exclusion_id,),
+        ).fetchone()
+        return {
+            "exclusion_id": effective_exclusion_id,
+            "existing_status": effective["decision"],
+            "existing_decided_by": effective["decided_by"],
+            "existing_decided_at": effective["decided_at"],
+            "outcome": outcome,
+        }
 
     def revoke_exclusion(self, actor_id: str, exclusion_id: int, reason: str) -> dict[str, Any]:
         self._require(actor_id, "exclusion.revoke")
@@ -533,6 +653,31 @@ class EvidenceReviewService:
             "FROM exclusion_requests e JOIN evidence_items o ON o.evidence_item_id=e.evidence_item_id "
             "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
         ).fetchall()
+        review_summary = {"effective": 0, "replay": 0, "lost_conflict": 0}
+        exclusion_reports: list[dict[str, Any]] = []
+        for row in exclusions:
+            entry: dict[str, Any] = dict(row)
+            decision_row = self.connection.execute(
+                "SELECT decision,note,decided_by,decided_at,idempotency_key "
+                "FROM review_decisions WHERE exclusion_id=?",
+                (row["exclusion_id"],),
+            ).fetchone()
+            entry["effective_decision"] = None if decision_row is None else {
+                "decision": decision_row["decision"],
+                "note": decision_row["note"],
+                "decided_by": decision_row["decided_by"],
+                "decided_at": decision_row["decided_at"],
+                "idempotency_key": decision_row["idempotency_key"],
+            }
+            attempt_rows = self.connection.execute(
+                "SELECT outcome,requested_decision,actor_id,idempotency_key,effective_exclusion_id,attempted_at "
+                "FROM review_attempts WHERE exclusion_id=? ORDER BY attempt_id",
+                (row["exclusion_id"],),
+            ).fetchall()
+            entry["review_attempts"] = [dict(attempt) for attempt in attempt_rows]
+            for attempt in attempt_rows:
+                review_summary[attempt["outcome"]] += 1
+            exclusion_reports.append(entry)
         events = self.connection.execute(
             "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
             "WHERE entity_type='batch' AND entity_id=? "
@@ -555,6 +700,7 @@ class EvidenceReviewService:
                 "result": json.loads(analysis_row["result_json"]),
             },
             "decision": None if decision_row is None else dict(decision_row),
-            "exclusions": [dict(row) for row in exclusions],
+            "exclusions": exclusion_reports,
+            "review_summary": review_summary,
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }
